@@ -2,6 +2,8 @@ from setuptools import setup, find_packages
 import os
 
 version = '0.1.dev0'
+version = version.rsplit('.', 1)
+version = version[0] + '.abstract.' + version[1]
 
 setup(name='plone.app.stagingbehavior',
       version=version,
