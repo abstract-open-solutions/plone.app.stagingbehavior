@@ -162,7 +162,7 @@ class ContentCopier( copier.ContentCopier, grok.Adapter ):
             self._do_replaceBaseline(object_2, object_1)
             contained.append((object_2, object_2))
 
-
+        wc_container = aq_parent( self.context )
         # delete the working copy
         wc_container._delObject( wc_id )
 
