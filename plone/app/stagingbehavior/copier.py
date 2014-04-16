@@ -49,17 +49,33 @@ class ContentCopier( copier.ContentCopier, grok.Adapter ):
         self._handleReferences( baseline, self.context, "checkin", wc_ref )
 
         # move the working copy to the baseline container, deleting the baseline
-        new_baseline = self._replaceBaseline( baseline )
+        new_baseline, contained = self._replaceBaseline( baseline )
 
         # patch the working copy with baseline info not preserved during checkout
         self._reassembleWorkingCopy( new_baseline, baseline )
 
+
+        # reset wf state security directly
+        workflow_tool = getToolByName(self.context, 'portal_workflow')
+        for contained_new_baseline, contained_baseline in contained:
+            if contained_baseline:
+                try:
+                    contained_new_baseline.workflow_history = \
+                        PersistentMapping(
+                            contained_baseline.workflow_history.items()
+                        )
+                except AttributeError:
+                    # No workflow apparently.  Oh well.
+                    pass
+            wfs = workflow_tool.getWorkflowsFor(contained_new_baseline)
+            for wf in wfs:
+                if not isinstance( wf, DCWorkflowDefinition ):
+                    continue
+                wf.updateRoleMappingsFor(contained_new_baseline)
+
         return new_baseline
 
-    def _replaceBaseline( self, baseline ):
-        wc_id = self.context.getId()
-        wc_container = aq_parent( self.context )
-
+    def _do_replaceBaseline( self, baseline, wc ):
         # copy all field values from the working copy to the baseline
         for schema in iterSchemata( baseline ):
             for name, field in getFieldsInOrder( schema ):
@@ -67,34 +83,90 @@ class ContentCopier( copier.ContentCopier, grok.Adapter ):
                 if field.readonly:
                     continue
                 try:
-                    value = field.get( schema( self.context ) )
+                    value = field.get( schema( wc ) )
                 except:
                     value = None
 
                 # TODO: We need a way to identify the DCFieldProperty
                 # fields and use the appropriate set_name/get_name
                 if name == 'effective':
-                    baseline.effective_date = self.context.effective()
+                    baseline.effective_date = wc.effective()
                 elif name == 'expires':
-                    baseline.expiration_date = self.context.expires()
+                    baseline.expiration_date = wc.expires()
                 elif name == 'subjects':
-                    baseline.setSubject(self.context.Subject())
+                    baseline.setSubject(wc.Subject())
                 else:
                     field.set( baseline, value )
 
         baseline.reindexObject()
 
         # copy annotations
-        wc_annotations = IAnnotations(self.context)
+        wc_annotations = IAnnotations(wc)
         baseline_annotations = IAnnotations(baseline)
 
         baseline_annotations.clear()
         baseline_annotations.update(wc_annotations)
 
+    def _replaceBaseline( self, baseline ):
+        wc_id = self.context.getId()
+        wc_container = aq_parent( self.context )
+
+        self._do_replaceBaseline( baseline, self.context )
+
+        catalog_tool = getToolByName(self.context, 'portal_catalog')
+        wc_path = '/'.join(self.context.getPhysicalPath())
+        baseline_path = '/'.join(baseline.getPhysicalPath())
+        wc_contained = {}
+        baseline_contained = {}
+        for contained, path in [(wc_contained, wc_path),
+                                (baseline_contained, baseline_path)]:
+            for brain in catalog_tool.searchResults(path=path):
+                if brain.getPath().rstrip('/') != path.rstrip('/'):
+                    contained[brain.getPath()[len(path.rstrip('/'))+1:]] = brain
+        wc_contained_set = set(wc_contained.keys())
+        baseline_contained_set = set(baseline_contained.keys())
+        new = list(wc_contained_set - baseline_contained_set)
+        delete = list(baseline_contained_set - wc_contained_set)
+        update = list(wc_contained_set & baseline_contained_set)
+        delete.sort(key=len, reverse=True)
+        new.sort(key=len)
+        contained = []
+        for path in delete:
+            object_ = baseline_contained[path].getObject()
+            container = aq_parent(aq_inner(object_))
+            container._delObject(object_.getId())
+        for path in new:
+            object_ = wc_contained[path].getObject()
+            wc_container = aq_parent(aq_inner(object_))
+            rel_path = '/'.join(
+                wc_container.getPhysicalPath()
+            )[len(wc_path.rstrip('/'))+1:].split('/')
+            current = baseline
+            for item in rel_path:
+                if item in current:
+                    current = current[item]
+                else:
+                    current = None
+                    break
+            if current is not None:
+                baseline_container = current
+                clipboard = wc_container.manage_copyObjects([object_.getId()])
+                result = baseline_container.manage_pasteObjects( clipboard )
+                # get a reference to the working copy
+                target_id = result[0]['new_id']
+                n_baseline = baseline_container._getOb( target_id )
+                contained.append((n_baseline, None))
+        for path in update:
+            object_1 = wc_contained[path].getObject()
+            object_2 = baseline_contained[path].getObject()
+            self._do_replaceBaseline(object_2, object_1)
+            contained.append((object_2, object_2))
+
+
         # delete the working copy
         wc_container._delObject( wc_id )
 
-        return baseline
+        return (baseline, contained)
 
     def _reassembleWorkingCopy( self, new_baseline, baseline ):
         # reattach the source's workflow history, try avoid a dangling ref
